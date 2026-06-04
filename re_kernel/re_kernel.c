@@ -57,6 +57,25 @@ static const char* binder_type[] = {
     "free_buffer_full",
 };
 
+// netlink 消息类型
+enum rekernel_cmd_type {
+  REKERNEL_CMD_REMOVE_PROC = 1,
+#ifdef CONFIG_NETWORK
+  REKERNEL_CMD_MONITOR_NET = 2,
+#endif /* CONFIG_NETWORK */
+};
+
+struct rekernel_cmd {
+  int type;
+#ifdef CONFIG_NETWORK
+  union {
+    struct {
+      int uid;
+    } monitor_net;
+  };
+#endif /* CONFIG_NETWORK */
+};
+
 #define IZERO (1UL << 0x10)
 #define UZERO (1UL << 0x20)
 
@@ -177,6 +196,24 @@ static inline bool frozen_task_group(struct task_struct* task) {
   return (jobctl_frozen(task) || cgroup_freezing(task));
 }
 
+#ifdef CONFIG_NETWORK
+// 暂定为32个, 且不需要删改, 此时理论比哈希表速度更快
+#define REKERNEL_NET_UID_MAX 32
+static uid_t rekernel_net_uids[REKERNEL_NET_UID_MAX] = {0};
+static unsigned long rekernel_net_uids_full = UZERO;
+static bool net_uid_monitored(uid_t uid) {
+  if (rekernel_net_uids_full == IZERO)
+    return true;
+  for (int i = 0; i < REKERNEL_NET_UID_MAX; i++) {
+    if (rekernel_net_uids[i] == uid)
+      return true;
+    else if (rekernel_net_uids[i] == 0)
+      return false;
+  }
+  return false;
+}
+#endif /* CONFIG_NETWORK */
+
 // netlink
 static struct sock* rekernel_netlink;
 static unsigned long rekernel_netlink_unit = UZERO;
@@ -206,18 +243,56 @@ static int send_netlink_message(char* msg) {
 }
 // 接收 netlink 消息
 static int netlink_rcv_msg(struct sk_buff* skb, struct nlmsghdr* nlh, struct netlink_ext_ack* extack) {
-  char* umsg = nlmsg_data(nlh);
-  if (!umsg)
+  if (nlmsg_len(nlh) < sizeof(struct { int type; }))
     return -EINVAL;
 
+  struct rekernel_cmd* cmd = nlmsg_data(nlh);
+
 #ifdef CONFIG_DEBUG
-  logkm("kernel recv packet from user: %s\n", umsg);
+  logkm("kernel recv cmd type=%d\n", cmd->type);
 #endif /* CONFIG_DEBUG */
 
-  if (!memcmp(umsg, "#proc_remove", nlmsg_len(nlh))) {
-    if (rekernel_dir) {
-      proc_remove(rekernel_dir);
+  switch (cmd->type) {
+    case REKERNEL_CMD_REMOVE_PROC:
+      if (rekernel_dir) {
+        proc_remove(rekernel_dir);
+      }
+      break;
+#ifdef CONFIG_NETWORK
+    case REKERNEL_CMD_MONITOR_NET: {
+      if (nlmsg_len(nlh) < sizeof(struct rekernel_cmd)) {
+#ifdef CONFIG_DEBUG
+        logkm("monitorNet error: payload too small\n");
+#endif /* CONFIG_DEBUG */
+        break;
+      }
+      uid_t muid = (uid_t)cmd->monitor_net.uid;
+#ifdef CONFIG_DEBUG
+      logkm("monitorNet uid=%d\n", muid);
+#endif /* CONFIG_DEBUG */
+      if (!net_uid_monitored(muid)) {
+        if (rekernel_net_uids[REKERNEL_NET_UID_MAX - 1] != 0) {
+          rekernel_net_uids_full = IZERO;
+#ifdef CONFIG_DEBUG
+          logkm("monitorNet error: rekernel_net_uids is full");
+#endif /* CONFIG_DEBUG */
+          break;
+        }
+        for (int i = 0; i < REKERNEL_NET_UID_MAX; i++) {
+          if (rekernel_net_uids[i] == 0) {
+            rekernel_net_uids[i] = muid;
+            break;
+          }
+        }
+      }
+      break;
     }
+#endif /* CONFIG_NETWORK */
+    default:
+#ifdef CONFIG_DEBUG
+      logkm("unknown cmd type=%d\n", cmd->type);
+#endif /* CONFIG_DEBUG */
+      break;
   }
   return 0;
 }
@@ -567,6 +642,9 @@ static void tcp_rcv_before(hook_fargs2_t* args, void* udata) {
 
   uid_t uid = sock_i_uid(sk).val;
   if (uid < MIN_USERAPP_UID)
+    return;
+
+  if (!net_uid_monitored(uid))
     return;
 
   int version = *(int*)udata;
