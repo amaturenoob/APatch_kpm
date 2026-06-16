@@ -1,0 +1,2 @@
+- name: GPT Translate Action - Translate any files with OpenAI ChatGPT
+  uses: imaun/gpt-translate-action@v1.9.0
